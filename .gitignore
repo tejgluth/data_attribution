@@ -4,8 +4,5 @@ __pycache__/
 .venv/
 
 checkpoints/
-data/
-results/
-results_debug*/
 
 .DS_Store

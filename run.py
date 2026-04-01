@@ -328,6 +328,75 @@ def run_verification(model, train_dataset, test_image, test_label, tracin_scores
         "harmful_correct": loss_no_harmful < loss_before,
     }
 
+#creates the .png visualization of top 5 most and least helpful datapoints
+def visualize(train_dataset, test_image, test_label, tracin_scores, verification_results):
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    sorted_indices = np.argsort(tracin_scores)
+    helpful_indices = sorted_indices[-5:][::-1] #reverses to get most helpful first so they match up
+    harmful_indices = sorted_indices[:5]
+
+    fig = plt.figure(figsize=(16, 8))
+    fig.suptitle("Data Attribution with TracIn", fontsize=14, fontweight="bold")
+
+    def get_image(idx): #helpers to get the image and label for a specific index in the training dataset
+        return train_dataset[idx][0].squeeze(0).numpy()
+
+    def get_label(idx):
+        return train_dataset[idx][1]
+
+    ax = fig.add_subplot(2, 7, 1)
+    ax.imshow(test_image.cpu().squeeze(0).numpy(), cmap="gray")
+    ax.set_title(f"Test image\nLabel: {test_label}", fontsize=9)
+    ax.axis("off")
+
+    #adds the images in the two rows, left to right
+    for col, idx in enumerate(helpful_indices, start=2):
+        ax = fig.add_subplot(2, 7, col)
+        ax.imshow(get_image(idx), cmap="gray")
+        ax.set_title(f"Label: {get_label(idx)}\n{tracin_scores[idx]:.3f}", fontsize=8, color="green")
+        ax.axis("off")
+        if col == 2:
+            ax.set_ylabel("HELPFUL", fontsize=9, color="green")
+
+    for col, idx in enumerate(harmful_indices, start=9):
+        ax = fig.add_subplot(2, 7, col)
+        ax.imshow(get_image(idx), cmap="gray")
+        ax.set_title(f"Label: {get_label(idx)}\n{tracin_scores[idx]:.3f}", fontsize=8, color="red")
+        ax.axis("off")
+        if col == 9:
+            ax.set_ylabel("HARMFUL", fontsize=9, color="red")
+
+    #barchart to show differences 
+    ax = fig.add_subplot(2, 7, 8)
+    labels = ["Before", "Helpful\nremoved", "Harmful\nremoved"]
+    values = [
+        verification_results["loss_before"],
+        verification_results["loss_no_helpful"],
+        verification_results["loss_no_harmful"],
+    ]
+    bars = ax.bar(labels, values, color=["gray", "red", "green"], alpha=0.8)
+    ax.set_title("Verification", fontsize=9)
+    ax.set_ylabel("Test loss", fontsize=8)
+    ax.bar_label(bars, fmt="%.3f", padding=3, fontsize=7)
+
+    ax.text(
+        0.5,
+        0.01,
+        f"Helpful correct: {verification_results['helpful_correct']}\n"
+        f"Harmful correct: {verification_results['harmful_correct']}",
+        transform=ax.transAxes,
+        ha="center",
+        va="bottom",
+        fontsize=7,
+        bbox={"boxstyle": "round", "facecolor": "wheat", "alpha": 0.5},
+    )
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96]) #worked better for me, auto packs everything
+    save_path = os.path.join(RESULTS_DIR, "results.png")
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+
 #prints the top scoring helpful and harmful training examples
 def print_score_summary(name, scores, dataset, count=5):
     helpful = np.argsort(scores)[-count:][::-1]
@@ -429,3 +498,12 @@ print(f"  Loss w/o helpful:      {verification_results['loss_no_helpful']:.4f}")
 print(f"  Loss w/o harmful:      {verification_results['loss_no_harmful']:.4f}")
 print(f"  Helpful removal works: {verification_results['helpful_correct']}")
 print(f"  Harmful removal works: {verification_results['harmful_correct']}")
+
+visualize(
+    train_dataset,
+    test_image,
+    test_label,
+    tracin_scores,
+    verification_results,
+)
+print(f"\nSaved figure to {os.path.join(RESULTS_DIR, 'results.png')}")
