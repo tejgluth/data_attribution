@@ -378,7 +378,7 @@ def visualize(train_dataset, test_image, test_label, tracin_scores, verification
     bars = ax.bar(labels, values, color=["gray", "red", "green"], alpha=0.8)
     ax.set_title("Verification", fontsize=9)
     ax.set_ylabel("Test loss", fontsize=8)
-    ax.bar_label(bars, fmt="%.3f", padding=3, fontsize=7)
+    ax.bar_label(bars, fmt="%.2e", padding=3, fontsize=7)
 
     ax.text(
         0.5,
@@ -444,11 +444,6 @@ model.eval()
 with torch.no_grad():
     predicted = model(test_image.unsqueeze(0)).argmax().item()
 
-print(f"\nTest example index: {TEST_INDEX}")
-print(f"True label:         {test_label}")
-print(f"Model prediction:   {predicted}")
-print(f"Correct:            {predicted == test_label}")
-
 tracin_scores = compute_tracin_scores(
     model,
     checkpoints,
@@ -474,13 +469,10 @@ print_score_summary("Influence Functions", influence_scores, train_dataset)
 
 tracin_ranks = np.argsort(np.argsort(tracin_scores)).astype(float)
 influence_ranks = np.argsort(np.argsort(influence_scores)).astype(float)
-spearman_r = np.corrcoef(tracin_ranks, influence_ranks)[0, 1]
 overlap = len(
     set(np.argsort(tracin_scores)[-TOP_K:]) &
     set(np.argsort(influence_scores)[-TOP_K:])
 )
-
-print(f"\nSpearman correlation: {spearman_r:.3f}")
 print(f"Top-{TOP_K} overlap: {overlap}/{TOP_K}")
 
 verification_results = run_verification(
