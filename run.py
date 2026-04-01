@@ -311,7 +311,7 @@ def run_verification(model, train_dataset, test_image, test_label, tracin_scores
     harmful_indices = list(sorted_indices[:TOP_K])
     helpful_indices = list(sorted_indices[-TOP_K:])
 
-    print(f"Baseline loss: {loss_before:.4f}")
+    print(f"Baseline loss: {loss_before:.2e}")
     print(f"Retraining without top-{TOP_K} helpful examples...")
     model_no_helpful = retrain_without(train_dataset, helpful_indices, device)
     loss_no_helpful = get_test_loss(model_no_helpful, test_image, test_label, device)
@@ -329,15 +329,15 @@ def run_verification(model, train_dataset, test_image, test_label, tracin_scores
     }
 
 #creates the .png visualization of top 5 most and least helpful datapoints
-def visualize(train_dataset, test_image, test_label, tracin_scores, verification_results):
+def visualize(train_dataset, test_image, test_label, scores, verification_results, method_name, output_name):
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    sorted_indices = np.argsort(tracin_scores)
+    sorted_indices = np.argsort(scores)
     helpful_indices = sorted_indices[-5:][::-1] #reverses to get most helpful first so they match up
     harmful_indices = sorted_indices[:5]
 
     fig = plt.figure(figsize=(16, 8))
-    fig.suptitle("Data Attribution with TracIn", fontsize=14, fontweight="bold")
+    fig.suptitle(f"Data Attribution with {method_name}", fontsize=14, fontweight="bold")
 
     def get_image(idx): #helpers to get the image and label for a specific index in the training dataset
         return train_dataset[idx][0].squeeze(0).numpy()
@@ -354,7 +354,7 @@ def visualize(train_dataset, test_image, test_label, tracin_scores, verification
     for col, idx in enumerate(helpful_indices, start=2):
         ax = fig.add_subplot(2, 7, col)
         ax.imshow(get_image(idx), cmap="gray")
-        ax.set_title(f"Label: {get_label(idx)}\n{tracin_scores[idx]:.3f}", fontsize=8, color="green")
+        ax.set_title(f"Label: {get_label(idx)}\n{scores[idx]:.3f}", fontsize=8, color="green")
         ax.axis("off")
         if col == 2:
             ax.set_ylabel("HELPFUL", fontsize=9, color="green")
@@ -362,7 +362,7 @@ def visualize(train_dataset, test_image, test_label, tracin_scores, verification
     for col, idx in enumerate(harmful_indices, start=9):
         ax = fig.add_subplot(2, 7, col)
         ax.imshow(get_image(idx), cmap="gray")
-        ax.set_title(f"Label: {get_label(idx)}\n{tracin_scores[idx]:.3f}", fontsize=8, color="red")
+        ax.set_title(f"Label: {get_label(idx)}\n{scores[idx]:.3f}", fontsize=8, color="red")
         ax.axis("off")
         if col == 9:
             ax.set_ylabel("HARMFUL", fontsize=9, color="red")
@@ -380,20 +380,8 @@ def visualize(train_dataset, test_image, test_label, tracin_scores, verification
     ax.set_ylabel("Test loss", fontsize=8)
     ax.bar_label(bars, fmt="%.2e", padding=3, fontsize=7)
 
-    ax.text(
-        0.5,
-        0.01,
-        f"Helpful correct: {verification_results['helpful_correct']}\n"
-        f"Harmful correct: {verification_results['harmful_correct']}",
-        transform=ax.transAxes,
-        ha="center",
-        va="bottom",
-        fontsize=7,
-        bbox={"boxstyle": "round", "facecolor": "wheat", "alpha": 0.5},
-    )
-
     plt.tight_layout(rect=[0, 0, 1, 0.96]) #worked better for me, auto packs everything
-    save_path = os.path.join(RESULTS_DIR, "results.png")
+    save_path = os.path.join(RESULTS_DIR, output_name)
     plt.savefig(save_path, dpi=150)
     plt.close(fig)
 
@@ -485,11 +473,27 @@ verification_results = run_verification(
 )
 
 print("\nVerification results:")
-print(f"  Loss before removal:   {verification_results['loss_before']:.4f}")
-print(f"  Loss w/o helpful:      {verification_results['loss_no_helpful']:.4f}")
-print(f"  Loss w/o harmful:      {verification_results['loss_no_harmful']:.4f}")
+print(f"  Loss before removal:   {verification_results['loss_before']:.2e}")
+print(f"  Loss w/o helpful:      {verification_results['loss_no_helpful']:.2e}")
+print(f"  Loss w/o harmful:      {verification_results['loss_no_harmful']:.2e}")
 print(f"  Helpful removal works: {verification_results['helpful_correct']}")
 print(f"  Harmful removal works: {verification_results['harmful_correct']}")
+
+influence_verification_results = run_verification(
+    model,
+    train_dataset,
+    test_image,
+    test_label,
+    influence_scores,
+    device,
+)
+
+print("\nInfluence verification results:")
+print(f"  Loss before removal:   {influence_verification_results['loss_before']:.2e}")
+print(f"  Loss w/o helpful:      {influence_verification_results['loss_no_helpful']:.2e}")
+print(f"  Loss w/o harmful:      {influence_verification_results['loss_no_harmful']:.2e}")
+print(f"  Helpful removal works: {influence_verification_results['helpful_correct']}")
+print(f"  Harmful removal works: {influence_verification_results['harmful_correct']}")
 
 visualize(
     train_dataset,
@@ -497,5 +501,18 @@ visualize(
     test_label,
     tracin_scores,
     verification_results,
+    "TracIn",
+    "results.png",
+)
+
+visualize(
+    train_dataset,
+    test_image,
+    test_label,
+    influence_scores,
+    influence_verification_results,
+    "Influence Functions",
+    "influence.png",
 )
 print(f"\nSaved figure to {os.path.join(RESULTS_DIR, 'results.png')}")
+print(f"Saved figure to {os.path.join(RESULTS_DIR, 'influence.png')}")
