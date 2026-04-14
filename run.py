@@ -10,8 +10,6 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
 
-
-# Change this when you move the repo to another machine.
 BASE_DIR = "/Users/speakeasy/HAI/data_attribution"
 DATA_DIR = os.path.join(BASE_DIR, "data")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
@@ -354,7 +352,7 @@ def visualize(train_dataset, test_image, test_label, scores, verification_result
     for col, idx in enumerate(helpful_indices, start=2):
         ax = fig.add_subplot(2, 7, col)
         ax.imshow(get_image(idx), cmap="gray")
-        ax.set_title(f"Label: {get_label(idx)}\n{scores[idx]:.3f}", fontsize=8, color="green")
+        ax.set_title(f"Label: {get_label(idx)}\n{scores[idx]:.2e}", fontsize=8, color="green")
         ax.axis("off")
         if col == 2:
             ax.set_ylabel("HELPFUL", fontsize=9, color="green")
@@ -362,7 +360,7 @@ def visualize(train_dataset, test_image, test_label, scores, verification_result
     for col, idx in enumerate(harmful_indices, start=9):
         ax = fig.add_subplot(2, 7, col)
         ax.imshow(get_image(idx), cmap="gray")
-        ax.set_title(f"Label: {get_label(idx)}\n{scores[idx]:.3f}", fontsize=8, color="red")
+        ax.set_title(f"Label: {get_label(idx)}\n{scores[idx]:.2e}", fontsize=8, color="red")
         ax.axis("off")
         if col == 9:
             ax.set_ylabel("HARMFUL", fontsize=9, color="red")
@@ -393,12 +391,12 @@ def print_score_summary(name, scores, dataset, count=5):
     print(f"\nTop {count} helpful examples ({name}):")
     for idx in helpful:
         _, label = dataset[idx]
-        print(f"  index={idx:4d} label={label} score={scores[idx]:+.4f}")
+        print(f"  index={idx:4d} label={label} score={scores[idx]:.2e}")
 
     print(f"\nTop {count} harmful examples ({name}):")
     for idx in harmful:
         _, label = dataset[idx]
-        print(f"  index={idx:4d} label={label} score={scores[idx]:+.4f}")
+        print(f"  index={idx:4d} label={label} score={scores[idx]:.2e}")
 
 #runs everything together
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
