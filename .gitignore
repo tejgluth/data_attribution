@@ -3,6 +3,7 @@ __pycache__/
 
 .venv/
 
-checkpoints/
+
+model/
 
 .DS_Store

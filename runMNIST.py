@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Subset
 BASE_DIR = "/Users/speakeasy/HAI/data_attribution"
 DATA_DIR = os.path.join(BASE_DIR, "data")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
+MODEL_DIR = os.path.join(BASE_DIR, "model")
 
 NUM_TRAIN = 5000
 NUM_TEST = 500
@@ -109,6 +110,7 @@ def train_model(model, train_loader, device):
     loss_fn = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     checkpoints = []
+    os.makedirs(MODEL_DIR, exist_ok=True)
 
     for epoch in range(1, NUM_EPOCHS + 1):
         model.train()
@@ -150,6 +152,7 @@ def train_model(model, train_loader, device):
                     },
                 }
             )
+            torch.save(checkpoints[-1], os.path.join(MODEL_DIR, f"model_epoch_{epoch}.pt"))
 
     if not checkpoints or checkpoints[-1]["epoch"] != NUM_EPOCHS:
         checkpoints.append(
@@ -161,6 +164,7 @@ def train_model(model, train_loader, device):
                 },
             }
         )
+        torch.save(checkpoints[-1], os.path.join(MODEL_DIR, f"model_epoch_{NUM_EPOCHS}.pt"))
 
     return checkpoints
     #ensures final checkpoint is always saved
@@ -402,10 +406,6 @@ def print_score_summary(name, scores, dataset, count=5):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.manual_seed(SEED)
 os.makedirs(RESULTS_DIR, exist_ok=True)
-
-print(f"Running on: {device}")
-print(f"Base folder: {BASE_DIR}")
-print(f"Random seed: {SEED}")
 
 train_dataset, test_dataset = load_data()
 train_loader = make_loader(train_dataset, shuffle=True)
