@@ -35,6 +35,9 @@ LISSA_DEPTH = 20
 LISSA_SCALE = 500.0
 
 TOP_K = 10
+NUM_GRADIENT_EXAMPLES = 160
+LOSS_GRID_SIZE = 31
+LOSS_GRID_SPAN = 1.2
 
 
 def load_data():
@@ -387,6 +390,168 @@ def visualize(train_dataset, test_image, test_label, scores, verification_result
     plt.savefig(save_path, dpi=150)
     plt.close(fig)
 
+
+#just scales any vector to length 1 so we can use it as a pure direction without caring about magnitude
+def normalize(vector):
+    length = torch.norm(vector)
+    if length == 0:
+        return vector
+    return vector / length
+
+
+#packs fc2 weights + biases into one flat vector so we can do simple arithmetic on them (like adding an offset)
+def get_fc2_weights(model):
+    return torch.cat([
+        model.fc2.weight.detach().reshape(-1),
+        model.fc2.bias.detach().reshape(-1),
+    ]).clone()
+
+
+#reverse of get_fc2_weights: writes a flat vector back into fc2's weight and bias tensors
+def set_fc2_weights(model, flat_weights):
+    weight_count = model.fc2.weight.numel()
+    with torch.no_grad():
+        model.fc2.weight.copy_(flat_weights[:weight_count].reshape_as(model.fc2.weight))
+        model.fc2.bias.copy_(flat_weights[weight_count:].reshape_as(model.fc2.bias))
+
+
+#uses SVD to find the top 3 directions of variance in high-dimensional gradient space, then projects everything down to 3D for plotting
+def project_to_3d(vectors):
+    vectors = vectors - vectors.mean(axis=0, keepdims=True) #center first so SVD finds real variance, not just offset
+    _, _, vh = np.linalg.svd(vectors, full_matrices=False) #rows of vh are principal components, sorted by variance
+    return vectors @ vh[:3].T, vh[:3].T #return both the projected coords and the basis so we can reuse it later
+
+
+def visualize_gradient_geometry(model, train_dataset, test_image, test_label, tracin_scores, device):
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    model.eval()
+
+    test_gradient = compute_gradient(model, test_image, test_label, device)
+    sorted_indices = np.argsort(tracin_scores)
+    helpful_index = int(sorted_indices[-1])
+    harmful_index = int(sorted_indices[0])
+    neutral_index = int(np.argmin(np.abs(tracin_scores))) #closest score to 0, basically "doesn't matter" example
+
+    #sample a spread of training examples plus always include the three special ones so they show up in the plot
+    sample_indices = np.linspace(0, len(train_dataset) - 1, NUM_GRADIENT_EXAMPLES, dtype=int)
+    sample_indices = np.unique(np.concatenate([
+        sample_indices,
+        [helpful_index, harmful_index, neutral_index],
+    ]))
+
+    #compute gradients for all the sampled training examples
+    train_gradients = []
+    for index in sample_indices:
+        image, label = train_dataset[index]
+        train_gradient = compute_gradient(model, image, label, device)
+        train_gradients.append(train_gradient.cpu().numpy())
+
+    train_gradients = np.array(train_gradients)
+
+    #stack test gradient on top so everything gets projected into the same 3D PCA space together
+    all_gradients = np.vstack([test_gradient.cpu().numpy(), train_gradients])
+    projected_gradients, pca_basis = project_to_3d(all_gradients)
+
+    original_weights = get_fc2_weights(model)
+    helpful_image, helpful_label = train_dataset[helpful_index]
+    helpful_gradient = compute_gradient(model, helpful_image, helpful_label, device)
+
+    #build a 2D coordinate system to scan the loss surface over:
+    #x-axis = test gradient direction, y-axis = helpful gradient after removing its component along x (Gram-Schmidt)
+    #this gives two perpendicular axes that span the most interesting part of weight space
+    x_direction = normalize(test_gradient)
+    y_direction = helpful_gradient - x_direction * torch.dot(helpful_gradient, x_direction)
+    if torch.norm(y_direction) == 0: #fallback if helpful gradient happens to be parallel to test gradient
+        y_direction = torch.zeros_like(x_direction)
+        y_direction[0] = 1.0
+        y_direction = y_direction - x_direction * torch.dot(y_direction, x_direction)
+    y_direction = normalize(y_direction)
+
+    #scan loss over the 2D plane by nudging fc2 weights at each grid point and measuring the test loss
+    grid = np.linspace(-LOSS_GRID_SPAN, LOSS_GRID_SPAN, LOSS_GRID_SIZE)
+    x_grid, y_grid = np.meshgrid(grid, grid)
+    loss_grid = np.zeros_like(x_grid)
+    image = test_image.unsqueeze(0).to(device)
+    label = torch.tensor([test_label], dtype=torch.long, device=device)
+
+    for row in range(LOSS_GRID_SIZE):
+        for col in range(LOSS_GRID_SIZE):
+            offset = x_grid[row, col] * x_direction + y_grid[row, col] * y_direction
+            set_fc2_weights(model, original_weights + offset)
+            with torch.no_grad():
+                loss_grid[row, col] = F.cross_entropy(model(image), label).item()
+
+    set_fc2_weights(model, original_weights) #restore weights after scanning, otherwise the model is messed up
+
+    fig = plt.figure(figsize=(12, 6))
+    fig.suptitle("Gradient geometry from the trained model", fontsize=16, fontweight="bold")
+
+    #probe a few labeled points off-center so we can see actual loss values on the surface
+    probe_points = [(1, -1), (1, 1), (0, -1), (0, 1), (-1, -1), (-1, 1)]
+    probe_losses = []
+    for x_value, y_value in probe_points:
+        offset = x_value * x_direction + y_value * y_direction
+        set_fc2_weights(model, original_weights + offset)
+        with torch.no_grad():
+            probe_losses.append(F.cross_entropy(model(image), label).item())
+    set_fc2_weights(model, original_weights)
+
+    ax1 = fig.add_subplot(1, 2, 1, projection="3d")
+    ax1.plot_surface(x_grid, y_grid, loss_grid, cmap="viridis", alpha=0.82, linewidth=0)
+    ax1.scatter(0, 0, loss_grid[LOSS_GRID_SIZE // 2, LOSS_GRID_SIZE // 2], color="black", s=45) #marks where the trained model actually sits
+    for (x_value, y_value), z_value in zip(probe_points, probe_losses):
+        ax1.scatter(x_value, y_value, z_value, color="white", edgecolors="black", s=52)
+        ax1.text(
+            x_value,
+            y_value,
+            z_value,
+            f" ({x_value}, {y_value})\nloss={z_value:.2e}",
+            fontsize=8,
+            color="black",
+        )
+    ax1.set_title("Actual test loss surface")
+    ax1.set_xlabel("test gradient")
+    ax1.set_ylabel("helpful gradient")
+    ax1.set_zlabel("test loss")
+    ax1.invert_xaxis()
+    ax1.view_init(elev=28, azim=-55)
+
+    ax3 = fig.add_subplot(1, 2, 2, projection="3d")
+
+    #find where each special example landed in train_gradients, then project into 3D
+    #@ pca_basis = dot product with each principal component, giving the gradient's coordinates in the compressed 3D space
+    sample_indices_list = list(sample_indices)
+    helpful_dir = train_gradients[sample_indices_list.index(helpful_index)] @ pca_basis
+    harmful_dir = train_gradients[sample_indices_list.index(harmful_index)] @ pca_basis
+    neutral_dir = train_gradients[sample_indices_list.index(neutral_index)] @ pca_basis
+
+    examples = [
+        ("helpful", helpful_index, tracin_scores[helpful_index], helpful_dir, "#2ca02c"),
+        ("harmful", harmful_index, tracin_scores[harmful_index], harmful_dir, "#d62728"),
+        ("neutral", neutral_index, tracin_scores[neutral_index], neutral_dir, "#7f7f7f"),
+    ]
+
+    for name, index, score, direction, color in examples:
+        direction = direction / max(np.linalg.norm(direction), 1e-12) * 2.0 #normalize arrow to length 2 so all arrows are same size in x/y
+        direction[2] = score / max(np.max(np.abs(tracin_scores)), 1e-12) * 2.0 #z encodes the actual tracin score so you can see positive vs negative
+        ax3.quiver(0, 0, 0, direction[0], direction[1], direction[2], color=color, linewidth=2.8)
+        ax3.text(direction[0], direction[1], direction[2], f"{name}\nindex={index}\nscore={score:.2e}", color=color)
+
+    ax3.set_title("TracIn score geometry")
+    ax3.set_xlabel("PC 1")
+    ax3.set_ylabel("PC 2")
+    ax3.set_zlabel("normalized TracIn score")
+    ax3.set_xlim(-2.3, 2.3)
+    ax3.set_ylim(-2.3, 2.3)
+    ax3.set_zlim(-2.3, 2.3)
+    ax3.view_init(elev=24, azim=-45)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    save_path = os.path.join(RESULTS_DIR, "gradient_geometry.png")
+    plt.savefig(save_path, dpi=170)
+    plt.close(fig)
+
+
 #prints the top scoring helpful and harmful training examples
 def print_score_summary(name, scores, dataset, count=5):
     helpful = np.argsort(scores)[-count:][::-1]
@@ -512,5 +677,15 @@ visualize(
     "Influence Functions",
     "influence.png",
 )
+
+visualize_gradient_geometry(
+    model,
+    train_dataset,
+    test_image,
+    test_label,
+    tracin_scores,
+    device,
+)
 print(f"\nSaved figure to {os.path.join(RESULTS_DIR, 'results.png')}")
 print(f"Saved figure to {os.path.join(RESULTS_DIR, 'influence.png')}")
+print(f"Saved figure to {os.path.join(RESULTS_DIR, 'gradient_geometry.png')}")
