@@ -10,5 +10,8 @@ started gradient visualization, worked mostly on normalizing the data and findin
 4/21:
 finishing up gradient visualization and plotting numerical points to illustrate with data how the x and y values change at specific points beyond minute differences in color,
 
+4/23:
+outlined RAM usage, began decided the list of functions to compare and turned into threads for later testing. Yet to create the actual RAM visualization and polling functionality
+
 bibliography:
 https://www.jmlr.org/papers/volume18/16-491/16-491.pdf
