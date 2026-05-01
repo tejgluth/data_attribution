@@ -1,4 +1,7 @@
 import os
+import subprocess
+import threading
+import time
 from shutil import which
 
 import matplotlib.pyplot as plt
@@ -38,6 +41,8 @@ TOP_K = 10
 NUM_GRADIENT_EXAMPLES = 160
 LOSS_GRID_SIZE = 31
 LOSS_GRID_SPAN = 1.2
+EFFICIENCY_POLL_INTERVAL = 0.001
+EXACT_IHVP_DAMPING = 1e-3 #small value added to the Hessian diagonal to keep it from being singular
 
 
 def load_data():
@@ -107,6 +112,59 @@ class SmallCNN(nn.Module):
 def count_parameters(model):
     return sum(param.numel() for param in model.parameters() if param.requires_grad)
 #just shows trainable parameters in the model because this really just doesn't work for super large models
+
+
+#reads current process RSS (Resident Set Size) memory in MB (megabytes) from the OS using the ps command
+def get_process_rss_mb():
+    rss_kb = subprocess.check_output(
+        ["ps", "-o", "rss=", "-p", str(os.getpid())],
+        text=True,
+    ).strip()
+    return float(rss_kb) / 1024.0
+
+
+#wraps any function to time it and track peak RAM (Random Access Memory) for both CPU and CUDA
+def profile_function(name, function, device):
+    start_rss_mb = get_process_rss_mb() #baseline memory before the function runs
+    peak_rss_mb = start_rss_mb
+    stop_event = threading.Event() #flag used to signal the sampler thread to stop
+
+    def sample_memory():
+        nonlocal peak_rss_mb #lets this inner function write back to the outer variable
+        while not stop_event.is_set(): #keep polling until the event is set
+            peak_rss_mb = max(peak_rss_mb, get_process_rss_mb())
+            time.sleep(EFFICIENCY_POLL_INTERVAL)
+        peak_rss_mb = max(peak_rss_mb, get_process_rss_mb()) #one last sample after stop signal so we don't miss the peak
+
+    sampler = threading.Thread(target=sample_memory, daemon=True) #background thread polls memory while the function runs
+    sampler.start()
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device) #flush GPU work before starting the clock so timing is accurate
+
+    start_time = time.perf_counter()
+    output = function()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device) #same thing after, flush GPU before stopping the clock
+    elapsed_seconds = time.perf_counter() - start_time
+
+    stop_event.set() #signals the sampler to stop polling
+    sampler.join() #waits for the thread to fully finish so peak_rss_mb is final
+
+    end_rss_mb = get_process_rss_mb() #memory after the function, just to have both bookends
+    result = {
+        "name": name,
+        "time_seconds": elapsed_seconds,
+        "start_rss_mb": start_rss_mb,
+        "end_rss_mb": end_rss_mb,
+        "peak_rss_mb": peak_rss_mb,
+        "peak_rss_delta_mb": max(0.0, peak_rss_mb - start_rss_mb), #how much RAM grew, clamped to 0 so it never shows negative
+    }
+    if device.type == "cuda":
+        result["peak_cuda_mb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 2) #converts bytes to MB
+
+    return output, result
 
 #basic training system, still the boring part
 def train_model(model, train_loader, device):
@@ -259,6 +317,34 @@ def compute_hvp(model, train_loader, vector, device):
     return torch.cat([grad.reshape(-1) for grad in hvp]).detach()
     #flattens tensors into a vector again
 
+
+#computes exact IHVP (Inverse Hessian-Vector Product) by explicitly building the full Hessian and solving a linear system, way more expensive than LiSSA but no approximation error
+def compute_exact_ihvp(model, train_loader, vector, device):
+    params = attribution_params(model)
+    images, labels = next(iter(train_loader))
+    images = images.to(device)
+    labels = labels.to(device)
+
+    loss = F.cross_entropy(model(images), labels)
+    grads = torch.autograd.grad(loss, params, create_graph=True) #keep graph so we can differentiate again for second order
+    flat_grads = torch.cat([grad.reshape(-1) for grad in grads]) #flattened like always so we can index into individual entries
+
+    hessian_rows = []
+    for index in range(flat_grads.numel()): #builds the Hessian row by row by differentiating each gradient entry again
+        second_order = torch.autograd.grad(
+            flat_grads[index],
+            params,
+            retain_graph=True, #retain so we can keep looping through all the rows
+        )
+        hessian_rows.append(torch.cat([grad.reshape(-1) for grad in second_order])) #each result is one row of the Hessian
+
+    hessian = torch.stack(hessian_rows) #assembles the full n x n Hessian matrix
+    identity = torch.eye(hessian.size(0), device=device, dtype=hessian.dtype)
+    stabilized_hessian = hessian + EXACT_IHVP_DAMPING * identity #adds damping on the diagonal to prevent singularity, kinda like ridge regression
+    solution = torch.linalg.solve(stabilized_hessian, vector.detach().unsqueeze(1)) #solves H*x = v directly for x, which gives us H^-1 * v
+    return solution.squeeze(1).detach() #removes the extra column dimension and detaches
+
+
 #implements LiSSA (linear time Stochastic Second-order Algorithm), to approximate inverse Hessian-vector product
 #H^-1 is like the raw test gradient adjusted by the local curvature of the loss surface:
 #if a direction is very "stiff" the inverse Hessian shrinks it, and if a direction is easy to move in, it allows more effect
@@ -288,6 +374,19 @@ def compute_influence_scores(model, train_loader, train_dataset, test_image, tes
         #defined as influence i = - g_test^T * H^-1 * g_train
         #makes sense since If the influence is negative, the similarity is positive, which means that the training example
         #induced a parameter movement that lines up with the direction to make the test loss go up 
+    return scores
+
+
+#same as compute_influence_scores but uses exact IHVP instead of LiSSA, much slower but no approximation error
+def compute_exact_influence_scores(model, train_loader, train_dataset, test_image, test_label, device):
+    model.eval()
+    g_test = compute_gradient(model, test_image, test_label, device)
+    s_test = compute_exact_ihvp(model, train_loader, g_test, device)
+
+    scores = np.zeros(len(train_dataset), dtype=np.float32)
+    for i, (image, label) in enumerate(train_dataset):
+        g_train = compute_gradient(model, image, label, device)
+        scores[i] = -torch.dot(s_test, g_train).item()
     return scores
 
 #baseline loss for specific test example
@@ -422,6 +521,7 @@ def project_to_3d(vectors):
     return vectors @ vh[:3].T, vh[:3].T #return both the projected coords and the basis so we can reuse it later
 
 
+#plots the loss surface in weight space and gradient directions as 3D arrows to show where each example "points" the model
 def visualize_gradient_geometry(model, train_dataset, test_image, test_label, tracin_scores, device):
     os.makedirs(RESULTS_DIR, exist_ok=True)
     model.eval()
@@ -552,6 +652,49 @@ def visualize_gradient_geometry(model, train_dataset, test_image, test_label, tr
     plt.close(fig)
 
 
+#prints time and peak RAM usage for each profiled step
+def print_efficiency_summary(results):
+    print("\nEfficiency summary:")
+    for result in results:
+        message = (
+            f"  {result['name']:20s} "
+            f"time={result['time_seconds']:.2f}s | "
+            f"peak RAM delta={result['peak_rss_delta_mb']:.2f} MB | "
+            f"peak RAM={result['peak_rss_mb']:.2f} MB"
+        )
+        if "peak_cuda_mb" in result:
+            message += f" | peak CUDA={result['peak_cuda_mb']:.2f} MB"
+        print(message)
+
+
+#bar charts comparing runtime and peak RAM increase across methods
+def visualize_efficiency(results):
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    names = [result["name"] for result in results]
+    times = [result["time_seconds"] for result in results]
+    ram_deltas = [result["peak_rss_delta_mb"] for result in results]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.2))
+    fig.suptitle("Data attribution efficiency comparison", fontsize=14, fontweight="bold")
+
+    ax1.bar(names, times, color="#4c78a8")
+    ax1.set_title("Runtime")
+    ax1.set_ylabel("seconds")
+    ax1.tick_params(axis="x", rotation=20)
+
+    ax2.bar(range(len(names)), ram_deltas, color="#f58518")
+    ax2.set_title("Peak RAM increase")
+    ax2.set_ylabel("MB")
+    ax2.set_xticks(range(len(names)), names)
+    ax2.tick_params(axis="x", rotation=20)
+
+    plt.tight_layout(rect=[0, 0.06, 1, 0.94], w_pad=3.0)
+    save_path = os.path.join(RESULTS_DIR, "efficiency_comparison.png")
+    plt.savefig(save_path, dpi=170)
+    plt.close(fig)
+
+
 #prints the top scoring helpful and harmful training examples
 def print_score_summary(name, scores, dataset, count=5):
     helpful = np.argsort(scores)[-count:][::-1]
@@ -593,31 +736,87 @@ test_image = test_image.to(device)
 
 model.eval()
 with torch.no_grad():
-    predicted = model(test_image.unsqueeze(0)).argmax().item()
+    predicted = model(test_image.unsqueeze(0)).argmax().item() #just checking what the model actually predicted for the test image
 
-tracin_scores = compute_tracin_scores(
-    model,
-    checkpoints,
-    train_dataset,
-    test_image,
-    test_label,
+#profile each method for speed and memory so we can compare their costs
+benchmark_results = []
+test_gradient = compute_gradient(model, test_image, test_label, device)
+
+#_ discards the actual output since we only care about the timing/memory stats here
+#lambda defers the call so profile_function can hold it and time it instead of it running immediately
+_, hvp_benchmark = profile_function(
+    "compute_hvp",
+    lambda: compute_hvp(model, train_loader, test_gradient, device),
     device,
 )
+benchmark_results.append(hvp_benchmark)
+
+_, lissa_benchmark = profile_function(
+    "lissa",
+    lambda: lissa(model, train_loader, test_gradient, device), #same lambda pattern as above
+    device,
+)
+benchmark_results.append(lissa_benchmark)
+
+_, exact_ihvp_benchmark = profile_function( #just benchmarking cost of exact IHVP vs LiSSA, output discarded
+    "Exact IHVP",
+    lambda: compute_exact_ihvp(model, train_loader, test_gradient, device),
+    device,
+)
+benchmark_results.append(exact_ihvp_benchmark)
+
+tracin_scores, tracin_benchmark = profile_function(
+    "TracIn",
+    lambda: compute_tracin_scores( #keeping the actual scores this time since we need them later
+        model,
+        checkpoints,
+        train_dataset,
+        test_image,
+        test_label,
+        device,
+    ),
+    device,
+)
+benchmark_results.append(tracin_benchmark)
 print_score_summary("TracIn", tracin_scores, train_dataset)
 
-model.load_state_dict(checkpoints[-1]["state_dict"])
+model.load_state_dict(checkpoints[-1]["state_dict"]) #restore to final checkpoint weights before running influence
 model.to(device)
 
-influence_scores = compute_influence_scores(
-    model,
-    train_loader,
-    train_dataset,
-    test_image,
-    test_label,
+influence_scores, influence_benchmark = profile_function(
+    "Influence (LiSSA)",
+    lambda: compute_influence_scores( #same pattern, keeping scores for verification and visualization
+        model,
+        train_loader,
+        train_dataset,
+        test_image,
+        test_label,
+        device,
+    ),
     device,
 )
+benchmark_results.append(influence_benchmark)
 print_score_summary("Influence Functions", influence_scores, train_dataset)
 
+exact_influence_scores, exact_influence_benchmark = profile_function(
+    "Exact Influence",
+    lambda: compute_exact_influence_scores( #keeping scores for comparison against LiSSA influence
+        model,
+        train_loader,
+        train_dataset,
+        test_image,
+        test_label,
+        device,
+    ),
+    device,
+)
+benchmark_results.append(exact_influence_benchmark)
+print_score_summary("Exact Influence Functions", exact_influence_scores, train_dataset)
+
+print_efficiency_summary(benchmark_results)
+visualize_efficiency(benchmark_results)
+
+#checks how much TracIn and influence agree on their top picks
 tracin_ranks = np.argsort(np.argsort(tracin_scores)).astype(float)
 influence_ranks = np.argsort(np.argsort(influence_scores)).astype(float)
 overlap = len(
@@ -689,3 +888,4 @@ visualize_gradient_geometry(
 print(f"\nSaved figure to {os.path.join(RESULTS_DIR, 'results.png')}")
 print(f"Saved figure to {os.path.join(RESULTS_DIR, 'influence.png')}")
 print(f"Saved figure to {os.path.join(RESULTS_DIR, 'gradient_geometry.png')}")
+print(f"Saved figure to {os.path.join(RESULTS_DIR, 'efficiency_comparison.png')}")
