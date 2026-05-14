@@ -13,5 +13,13 @@ finishing up gradient visualization and plotting numerical points to illustrate 
 4/23:
 outlined RAM usage, began decided the list of functions to compare and turned into threads for later testing. Yet to create the actual RAM visualization and polling functionality
 
+4/25-5/08:
+created RAM visualization completely, took a lot of outside of class hours though
+
+5/08-5/15: 
+applied the file to a more complicated image recognition cifar-10 dataset, changed values and the model type to make it work and interpreted results
+
+
+
 bibliography:
-https://www.jmlr.org/papers/volume18/16-491/16-491.pdf
+https://www.jmlr.org/papers/volume18/16-491/16-491.pdf (LiSSA)
